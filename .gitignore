@@ -1,0 +1,38 @@
+node_modules/
+dist/
+.cache/
+*.tsbuildinfo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# Temp
+tmp/
+/tmp/
+
+# Personal and fork artifacts
+.claude/
+.husky/
+.superpowers/
+.github/
+.pi/
+token-optimizer/
+
+# Build output
+packages/*/dist/
