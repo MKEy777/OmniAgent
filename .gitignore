@@ -36,3 +36,5 @@ token-optimizer/
 
 # Build output
 packages/*/dist/
+
+docs/
