@@ -13,6 +13,7 @@
 
 - **[opencode] 尽量用简要的中文对话**
 - **[opencode] 每次完成有意义的开发或升级后，更新 `docs/context.md`，记录项目背景、功能、进度，确保其他会话能了解项目状态**
+- **[opencode] `docs/context.md` 字符数超过 10000 时，追加新条目前先压缩旧的 Session History。压缩规则：保留日期和做了什么（干成了什么），删除具体修复细节（修了什么 Bug），将多条合并为单条折叠。目标是只记录设计哲学、架构决策和项目进度。**
 
 ## Code Quality
 
@@ -108,19 +109,13 @@ tmux kill-session -t omni-test
 
 ## Changelog
 
-Location: `packages/*/CHANGELOG.md` (one per package).
+Location: `packages/coding-agent/CHANGELOG.md`.
 
-Sections under `## [Unreleased]`: `### Breaking Changes` (API changes requiring migration), `### Added`, `### Changed`, `### Fixed`, `### Removed`.
+Sections under `## [Unreleased]`: `### Added`, `### Changed`, `### Fixed`, `### Removed`.
 
 Rules:
 
 - All new entries go under `## [Unreleased]`. Read the full section first and append to existing subsections; never duplicate them.
-- Released version sections (e.g. `## [0.12.2]`) are immutable; never modify them.
-
-Attribution:
-
-- Internal (from issues): `Fixed foo bar ([#123](https://github.com/MKEy777/OmniAgent/issues/123))`
-- External contributions: `Added feature X ([#456](https://github.com/MKEy777/OmniAgent/pull/456) by [@username](https://github.com/username))`
 
 ## Releasing
 

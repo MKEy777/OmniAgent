@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { appendFile, mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -47,12 +47,14 @@ function isoDate(d: Date): string {
 	return d.toISOString().slice(0, 10);
 }
 
-/** Extract simple keywords from text (lowercased, 3+ char words, deduped). */
+/** Extract simple keywords from text (lowercased, deduped). 3+ for ASCII, 2+ for CJK. */
 function extractKeywords(text: string): string[] {
+	const hasCJK = /[\u4e00-\u9fff\u3400-\u4dbf]/.test(text);
+	const minLen = hasCJK ? 2 : 3;
 	const words = text
 		.toLowerCase()
 		.split(/\W+/)
-		.filter((w) => w.length >= 3);
+		.filter((w) => w.length >= minLen && !/^\d+$/.test(w));
 	return [...new Set(words)];
 }
 
@@ -586,7 +588,7 @@ export default function (pi: ExtensionAPI) {
 		name: "memory_search",
 		label: "Memory Search",
 		description:
-			"Search across all memory sources (memory.md, agent.md, events/pending/, events/processed/) by keyword or topic. Use for long-tail memory not already injected in context.",
+			"Search across all memory sources (memory.md, agent.md, events/pending/, events/processed/) by keyword or topic. Use for long-tail memory not already injected in context. Use specific keyword(s) as the query, for example 'Vitest' or 'TypeScript' or '2 空格'. Chinese 2-character keywords work too.",
 		promptSnippet: "memory_search: search project memory, agent experience, and event logs by topic",
 		parameters: Type.Object({
 			query: Type.String({ description: "Keyword or topic to search for in memory" }),
@@ -685,13 +687,13 @@ export default function (pi: ExtensionAPI) {
 	}): Promise<void> {
 		const pendingDir = getEventsDir(ctx.cwd, "pending");
 		if (!existsSync(pendingDir)) {
-			ctx.ui.notify("No pending events to consolidate", "info");
+			ctx.ui.notify("No pending events to consolidate / 没有待整合的事件", "info");
 			return;
 		}
 
 		const events = await loadPendingEvents(ctx.cwd);
 		if (events.length === 0) {
-			ctx.ui.notify("No valid events found in pending/", "info");
+			ctx.ui.notify("No valid events found in pending/ / pending/ 中没有有效事件", "info");
 			return;
 		}
 
@@ -699,12 +701,79 @@ export default function (pi: ExtensionAPI) {
 		const agentEvents = events.filter((e) => e.scope === "agent" || e.scope === "user");
 		const result = await consolidateEvents(ctx.cwd, projectEvents, agentEvents, writeQueue);
 		await writeQueue.flushAll();
-		ctx.ui.notify(`Consolidated ${result.total} events (${result.project} project, ${result.agent} agent)`, "info");
+		ctx.ui.notify(
+			`Consolidated ${result.total} events / 已整合 ${result.total} 条事件 (项目 ${result.project}, 全局 ${result.agent})`,
+			"info",
+		);
 	}
 
 	pi.registerCommand("memory-consolidate", {
-		description: "Consolidate pending events into stable memory files (memory.md / agent.md)",
+		description: "Consolidate pending events into stable memory files / 整合待处理事件到稳定记忆文件 memory.md / agent.md",
 		handler: async (_args, ctx) => doConsolidate(ctx),
+	});
+
+	async function doClear(ctx: { cwd: string; ui: { notify: (msg: string, type?: string) => void } }) {
+		const projectDir = join(ctx.cwd, ".pi");
+		const globalDir = getGlobalDir();
+		await ensureDir(projectDir);
+		await ensureDir(globalDir);
+
+		const emptyMemory = `# Project Memory\n\n## Background\n（项目是什么：目标、核心模块、当前状态、业务背景）\n\n## Tech Stack\n（项目用什么：框架、语言、依赖、运行方式、构建方式）\n\n## Decisions\n（为什么这么做：架构决策、历史取舍、已踩坑、不再采用的方案）\n\n## Facts\n（长期事实，可按 confidence 标注）\n\n## History Summaries\n（历史会话摘要）\n`;
+		await writeFile(join(projectDir, "memory.md"), emptyMemory, "utf-8");
+
+		const emptyAgent = `# Agent Self-Evolution Memory\n\n## Working Patterns\n（通用工作模式）\n\n## Coding Lessons\n（编码经验、踩坑、可复用解法）\n\n## Planning Lessons\n（任务拆解、规划经验）\n\n## Failure Cases\n（失败案例与正确做法）\n\n## User Interaction Lessons\n（与用户协作、沟通的经验）\n`;
+		await writeFile(join(globalDir, "agent.md"), emptyAgent, "utf-8");
+
+		for (const sub of ["pending", "processed"]) {
+			const dir = getEventsDir(ctx.cwd, sub);
+			if (existsSync(dir)) {
+				const files = await readdir(dir);
+				for (const f of files) {
+					try { await rm(join(dir, f)); } catch { /* ignore */ }
+				}
+			}
+		}
+
+		const threadDir = getThreadDir(ctx.cwd);
+		if (existsSync(threadDir)) {
+			const files = await readdir(threadDir);
+			for (const f of files) {
+				try { await rm(join(threadDir, f)); } catch { /* ignore */ }
+			}
+		}
+
+		ctx.ui.notify("All memory cleared / 已清空所有记忆", "info");
+	}
+
+	pi.registerCommand("memory-clear", {
+		description: "Clear all memory / 清空所有记忆（memory.md / agent.md / events / threads）",
+		handler: async (_args, ctx) => doClear(ctx),
+	});
+
+	async function doClearProject(ctx: { cwd: string; ui: { notify: (msg: string, type?: string) => void } }) {
+		const projectDir = join(ctx.cwd, ".pi");
+		await ensureDir(projectDir);
+		const emptyMemory = `# Project Memory\n\n## Background\n（项目是什么：目标、核心模块、当前状态、业务背景）\n\n## Tech Stack\n（项目用什么：框架、语言、依赖、运行方式、构建方式）\n\n## Decisions\n（为什么这么做：架构决策、历史取舍、已踩坑、不再采用的方案）\n\n## Facts\n（长期事实，可按 confidence 标注）\n\n## History Summaries\n（历史会话摘要）\n`;
+		await writeFile(join(projectDir, "memory.md"), emptyMemory, "utf-8");
+		ctx.ui.notify("Project memory cleared / 已清空项目记忆", "info");
+	}
+
+	async function doClearGlobal(ctx: { cwd: string; ui: { notify: (msg: string, type?: string) => void } }) {
+		const globalDir = getGlobalDir();
+		await ensureDir(globalDir);
+		const emptyAgent = `# Agent Self-Evolution Memory\n\n## Working Patterns\n（通用工作模式）\n\n## Coding Lessons\n（编码经验、踩坑、可复用解法）\n\n## Planning Lessons\n（任务拆解、规划经验）\n\n## Failure Cases\n（失败案例与正确做法）\n\n## User Interaction Lessons\n（与用户协作、沟通的经验）\n`;
+		await writeFile(join(globalDir, "agent.md"), emptyAgent, "utf-8");
+		ctx.ui.notify("Global agent memory cleared / 已清空全局 Agent 记忆", "info");
+	}
+
+	pi.registerCommand("memory-clear-project", {
+		description: "Clear project memory / 清空项目记忆（memory.md）",
+		handler: async (_args, ctx) => doClearProject(ctx),
+	});
+	pi.registerCommand("memory-clear-global", {
+		description: "Clear global agent memory / 清空全局 Agent 记忆（agent.md）",
+		handler: async (_args, ctx) => doClearGlobal(ctx),
+	});
 	});
 
 	// --------------------------------------------------------------------------
@@ -760,26 +829,21 @@ export default function (pi: ExtensionAPI) {
 		const pendingDir = getEventsDir(ctx.cwd, "pending");
 		if (!existsSync(pendingDir)) return;
 
-		const files = await readdir(pendingDir);
-		const pendingFiles = files.filter((f) => f.endsWith(".md"));
-		if (pendingFiles.length < AUTO_CONSOLIDATE_THRESHOLD) return;
-
-		// Fire-and-forget: don't block turn end
 		const events = await loadPendingEvents(ctx.cwd);
-		if (events.length === 0) return;
+		if (events.length < AUTO_CONSOLIDATE_THRESHOLD) return;
 
 		const projectEvents = events.filter((e) => e.scope === "project");
 		const agentEvents = events.filter((e) => e.scope === "agent" || e.scope === "user");
 		const result = await consolidateEvents(ctx.cwd, projectEvents, agentEvents, writeQueue);
 		await writeQueue.flushAll();
 		ctx.ui.notify(
-			`Auto-consolidated ${result.total} events (${result.project} project, ${result.agent} agent)`,
+			`Auto-consolidated ${result.total} events / 自动整合 ${result.total} 条事件 (项目 ${result.project}, 全局 ${result.agent})`,
 			"info",
 		);
 	});
 
 	// --------------------------------------------------------------------------
-	// 8. Bash guard: prevent writes to rules.md
+	// 8. Bash guard: prevent writes to rules.md (reads allowed)
 	// --------------------------------------------------------------------------
 	pi.on("tool_call", async (event) => {
 		if (event.toolName !== "bash" && event.toolName !== "write" && event.toolName !== "edit") return;
@@ -787,10 +851,22 @@ export default function (pi: ExtensionAPI) {
 		const input = event.input as { command?: string; filePath?: string; path?: string };
 		const target = input.command ?? input.filePath ?? input.path ?? "";
 
-		if (target.includes(RULES_GUARD_PATH) || target.includes("rules.md")) {
+		if (!target.includes(RULES_GUARD_PATH) && !target.includes("rules.md")) return;
+
+		// write/edit tools always write to the target path
+		if (event.toolName === "write" || event.toolName === "edit") {
 			return {
 				block: true,
-				reason: `Blocked by memory extension: ${RULES_GUARD_PATH} is read-only (user-managed). Use ~/.pi/agent/rules.md manually.`,
+				reason: `HARD POLICY: ${RULES_GUARD_PATH} is user-managed and read-only. The agent CANNOT write to this file by any means. Inform the user to edit it manually. Do not retry.`,
+			};
+		}
+
+		// bash: only block if writing to rules.md (has redirect), not reading
+		const isWrite = /[>|]|tee\s+.*rules\.md|echo.*rules\.md|printf.*rules\.md/.test(target);
+		if (isWrite) {
+			return {
+				block: true,
+				reason: `HARD POLICY: ${RULES_GUARD_PATH} is user-managed and read-only. The agent CANNOT write to this file by any means. Inform the user to edit it manually. Do not retry.`,
 			};
 		}
 	});

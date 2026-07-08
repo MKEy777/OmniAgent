@@ -59,7 +59,10 @@ type LoadedResourcesContext = {
 			getSkills: () => LoadedResourcesResult<{ skills: [] }>;
 			getPrompts: () => LoadedResourcesResult<{ prompts: [] }>;
 			getThemes: () => LoadedResourcesResult<{ themes: [] }>;
-			getExtensions: () => { extensions: []; errors: [] };
+			getExtensions: () => {
+				extensions: Array<{ path: string; sourceInfo?: undefined }>;
+				errors: [];
+			};
 		};
 		extensionRunner: {
 			getCommandDiagnostics: () => [];
@@ -267,6 +270,21 @@ describe("regression #5943: session_start transient UI", () => {
 		const rendered = root.render(80).join("\n");
 		expect(rendered).not.toContain("stale resources");
 		expect(rendered.indexOf("[Context]")).toBeLessThan(rendered.indexOf("restored message"));
+	});
+
+	it("does not render extensions in loaded resources", () => {
+		initTheme("dark", false);
+		const context = createLoadedResourcesContext();
+		context.session.resourceLoader.getExtensions = () => ({
+			extensions: [{ path: "/repo/.pi/extensions/memory.ts", sourceInfo: undefined }],
+			errors: [],
+		});
+
+		interactiveModePrototype.showLoadedResources.call(context);
+
+		const rendered = context.loadedResourcesContainer.render(80).join("\n");
+		expect(rendered).not.toContain("[Extensions]");
+		expect(rendered).not.toContain("memory.ts");
 	});
 
 	it("renders replacement session state before session_start handlers can notify", async () => {

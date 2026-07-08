@@ -977,12 +977,6 @@ export class InteractiveMode {
 		return result;
 	}
 
-	private formatExtensionDisplayPath(path: string): string {
-		let result = this.formatDisplayPath(path);
-		result = result.replace(/\/index\.ts$/, "").replace(/\/index\.js$/, "");
-		return result;
-	}
-
 	private formatContextPath(p: string): string {
 		const cwd = path.resolve(this.sessionManager.getCwd());
 		const absolutePath = path.isAbsolute(p) ? path.resolve(p) : path.resolve(cwd, p);
@@ -1038,105 +1032,6 @@ export class InteractiveMode {
 			return segments[segments.length - 1]!;
 		}
 		return shortPath;
-	}
-
-	private getCompactPackageSourceLabel(sourceInfo?: SourceInfo): string {
-		const source = sourceInfo?.source ?? "";
-		if (source.startsWith("npm:")) {
-			return source.slice("npm:".length) || source;
-		}
-
-		const gitSource = parseGitUrl(source);
-		if (gitSource) {
-			return gitSource.path || source;
-		}
-
-		return source;
-	}
-
-	private getCompactExtensionLabel(resourcePath: string, sourceInfo?: SourceInfo): string {
-		if (!this.isPackageSource(sourceInfo)) {
-			return this.getCompactPathLabel(resourcePath, sourceInfo);
-		}
-
-		const sourceLabel = this.getCompactPackageSourceLabel(sourceInfo);
-		if (!sourceLabel) {
-			return this.getCompactPathLabel(resourcePath, sourceInfo);
-		}
-
-		const shortPath = this.getShortPath(resourcePath, sourceInfo).replace(/\\/g, "/");
-		const packagePath = shortPath.startsWith("extensions/") ? shortPath.slice("extensions/".length) : shortPath;
-		const parsedPath = path.posix.parse(packagePath);
-
-		if (parsedPath.name === "index") {
-			return !parsedPath.dir || parsedPath.dir === "." ? sourceLabel : `${sourceLabel}:${parsedPath.dir}`;
-		}
-
-		return `${sourceLabel}:${packagePath}`;
-	}
-
-	private getCompactDisplayPathSegments(resourcePath: string): string[] {
-		return this.formatDisplayPath(resourcePath)
-			.replace(/\\/g, "/")
-			.split("/")
-			.filter((segment) => segment.length > 0 && segment !== "~");
-	}
-
-	private getCompactNonPackageExtensionLabel(
-		resourcePath: string,
-		index: number,
-		allPaths: Array<{ path: string; segments: string[] }>,
-	): string {
-		const segments = allPaths[index]?.segments;
-		if (!segments || segments.length === 0) {
-			return this.getCompactPathLabel(resourcePath);
-		}
-
-		for (let segmentCount = 1; segmentCount <= segments.length; segmentCount += 1) {
-			const candidate = segments.slice(-segmentCount).join("/");
-			const isUnique = allPaths.every((item, itemIndex) => {
-				if (itemIndex === index) {
-					return true;
-				}
-				return item.segments.slice(-segmentCount).join("/") !== candidate;
-			});
-
-			if (isUnique) {
-				return candidate;
-			}
-		}
-
-		return segments.join("/");
-	}
-
-	private getCompactExtensionLabels(extensions: Array<{ path: string; sourceInfo?: SourceInfo }>): string[] {
-		const nonPackageExtensions = extensions
-			.map((extension) => {
-				const segments = this.getCompactDisplayPathSegments(extension.path);
-				const lastSegment = segments[segments.length - 1];
-				if (segments.length > 1 && (lastSegment === "index.ts" || lastSegment === "index.js")) {
-					segments.pop();
-				}
-				return {
-					path: extension.path,
-					sourceInfo: extension.sourceInfo,
-					segments,
-				};
-			})
-			.filter((extension) => !this.isPackageSource(extension.sourceInfo));
-
-		return extensions.map((extension) => {
-			if (this.isPackageSource(extension.sourceInfo)) {
-				return this.getCompactExtensionLabel(extension.path, extension.sourceInfo);
-			}
-
-			const nonPackageIndex = nonPackageExtensions.findIndex((item) => item.path === extension.path);
-			if (nonPackageIndex === -1) {
-				return this.getCompactPathLabel(extension.path, extension.sourceInfo);
-			}
-
-			return this.getCompactNonPackageExtensionLabel(extension.path, nonPackageIndex, nonPackageExtensions);
-		});
 	}
 
 	private getDisplaySourceInfo(sourceInfo?: SourceInfo): {
@@ -1445,17 +1340,6 @@ export class InteractiveMode {
 				});
 				const promptCompactList = formatCompactList(templates.map((template) => `/${template.name}`));
 				addLoadedSection("Prompts", promptCompactList, templateList);
-			}
-
-			if (extensions.length > 0) {
-				const groups = this.buildScopeGroups(extensions);
-				const extList = this.formatScopeGroups(groups, {
-					formatPath: (item) => this.formatExtensionDisplayPath(item.path),
-					formatPackagePath: (item) =>
-						this.formatExtensionDisplayPath(this.getShortPath(item.path, item.sourceInfo)),
-				});
-				const extensionCompactList = formatCompactList(this.getCompactExtensionLabels(extensions));
-				addLoadedSection("Extensions", extensionCompactList, extList, "mdHeading");
 			}
 
 			// Show loaded themes (excluding built-in)

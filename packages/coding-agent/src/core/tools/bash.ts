@@ -303,6 +303,10 @@ export function createBashToolDefinition(
 		label: "bash",
 		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.`,
 		promptSnippet: "Execute bash commands (ls, grep, find, etc.)",
+		promptGuidelines: [
+			"For filesystem exploration use the find/ls/grep tools instead of bash equivalents (they are scoped to the project).",
+			"If you must run bash find, grep -r, or other scanning commands, always set a timeout (e.g. timeout: 10 for project-wide scans, timeout: 5 for single-directory commands).",
+		],
 		parameters: bashSchema,
 		async execute(
 			_toolCallId,

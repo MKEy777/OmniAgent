@@ -16,10 +16,13 @@ pi (pi-monorepo) is an open-source AI coding agent with a Terminal UI (TUI). It 
 
 ## Built-in Agent System
 
-pi has two built-in agents switchable via **Tab** key (empty input → toggle, text input → autocomplete):
+pi has three built-in agents switchable via **Tab** key (empty input → toggle, text input → autocomplete):
 
 - **Coding** (default): Full-access agent for development work. All tools available, no restrictions.
 - **Plan**: Read-only agent for code analysis and planning. Edit/write denied except `.pi/plan/**`, dangerous bash blocked.
+- **Commit**: Plan executor that reads `plan.json`, implements all tasks, runs tests, and commits.
+
+Architecture document: `docs/architecture/plan-agent-architecture.md`
 
 ## Plan Mode Features (implemented in this session)
 
@@ -143,7 +146,7 @@ Each extension receives `ExtensionAPI` (`pi`) with event hooks, tool registratio
 
 Implemented as extension example at `packages/coding-agent/examples/extensions/memory.ts`.
 
-Design document: `docs/memory_plan.md`
+Design document: `docs/architecture/memory-architecture.md`
 
 ### Deployment
 
@@ -199,14 +202,13 @@ JSONL storage with tree-based branching (fork/resume/navigate). Context compacti
 
 ## Session History
 
-### 2026-07-08: TUI Windows 中文命令输出解码修复
+### 2026-07-08: 欢迎页隐藏 Extensions 区块
 
-- 修复 TUI 执行命令时 Windows 旧代码页输出的中文显示为 `����` 的问题。
-- 新增 `ShellOutputDecoder`：优先按 UTF-8 流式解码，遇到非法 UTF-8 字节时回退到 GB18030，覆盖 CP936/GBK 中文输出。
-- `executeBashWithOperations` 和 bash tool 的 `OutputAccumulator` 统一使用该解码器，保留原有 ANSI 清理、二进制过滤、截断和临时完整输出文件逻辑。
-- 新增回归测试覆盖 bash tool 结果与直接 bash 执行路径的 GBK 中文输出，并确认原 UTF-8 分块解码行为不回退。
+- TUI 欢迎页 `showLoadedResources()` 不再打印 `[Extensions]` 分组，避免启动时显示已加载扩展列表。
+- 扩展加载、运行和扩展诊断仍保留；仅隐藏欢迎页 loaded-resources 列表中的扩展展示。
+- 新增回归测试覆盖存在扩展时不渲染 `[Extensions]` 和扩展文件名。
 
-### 2026-07-08: Context documentation maintenance rule
+### 2026-07-08: Windows 中文输出解码 + Context 维护规则
 
-- Added rule to `AGENTS.md`: 用简要中文对话，每次有意义变更后更新 `docs/context.md`
-- `docs/context.md` 已对接为项目级持久化记忆，确保多会话间项目状态同步
+- TUI bash 命令输出增加 GB18030 回退解码，解决 Windows 旧代码页中文乱码
+- AGENTS.md 新增 context.md 维护规则：中文对话 + 每次有意义变更后更新
