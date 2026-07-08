@@ -9,6 +9,11 @@
 - When the user asks a question, answer it first before making edits or running implementation commands.
 - When responding to user feedback or an analysis, explicitly say whether you agree or disagree before saying what you changed.
 
+## OpenCode Specific
+
+- **[opencode] 尽量用简要的中文对话**
+- **[opencode] 每次完成有意义的开发或升级后，更新 `docs/context.md`，记录项目背景、功能、进度，确保其他会话能了解项目状态**
+
 ## Code Quality
 
 - Read files in full before wide-ranging changes, before editing files you have not fully inspected, and when asked to investigate or audit. Do not rely on search snippets for broad changes.

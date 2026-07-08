@@ -18,6 +18,7 @@
 - Fixed oversized bash tool timeouts to fail with a clear validation error instead of being clamped to an immediate timeout ([#6181](https://github.com/earendil-works/pi/issues/6181)).
 - Fixed the edit tool schema to allow model-invented extra replacement fields instead of rejecting otherwise valid edits ([#6278](https://github.com/earendil-works/pi/issues/6278)).
 - Fixed Plan mode permissions to use explicit read, plan-write, and read-only bash capabilities instead of tool hiding and bash blacklists.
+- Fixed Windows command output decoding so Chinese text from legacy code pages no longer renders as replacement characters in the TUI.
 
 ### Removed
 

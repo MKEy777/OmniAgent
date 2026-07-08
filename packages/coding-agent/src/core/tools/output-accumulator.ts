@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { createWriteStream, type WriteStream } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ShellOutputDecoder } from "../../utils/shell-output-decoder.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, type TruncationResult, truncateTail } from "./truncate.ts";
 
 export interface OutputAccumulatorOptions {
@@ -37,7 +38,7 @@ export class OutputAccumulator {
 	private readonly maxBytes: number;
 	private readonly maxRollingBytes: number;
 	private readonly tempFilePrefix: string;
-	private readonly decoder = new TextDecoder();
+	private readonly decoder = new ShellOutputDecoder();
 
 	private rawChunks: Buffer[] = [];
 	private tailText = "";
@@ -67,7 +68,7 @@ export class OutputAccumulator {
 		}
 
 		this.totalRawBytes += data.length;
-		this.appendDecodedText(this.decoder.decode(data, { stream: true }));
+		this.appendDecodedText(this.decoder.decode(data));
 
 		if (this.tempFileStream || this.shouldUseTempFile()) {
 			this.ensureTempFile();
@@ -82,7 +83,7 @@ export class OutputAccumulator {
 			return;
 		}
 		this.finished = true;
-		this.appendDecodedText(this.decoder.decode());
+		this.appendDecodedText(this.decoder.finish());
 		if (this.shouldUseTempFile()) {
 			this.ensureTempFile();
 		}
