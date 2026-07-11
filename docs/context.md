@@ -153,49 +153,31 @@ Design document: `docs/architecture/memory-architecture.md`
 
 Run `npm run setup-extensions` — creates a junction (`~/.pi/agent/extensions/` → `examples/extensions/`), so all example extensions are available globally and changes are instantly reflected.
 
-### Architecture
+### Architecture (2026-07-11: migrated to 3-file structure)
 
-- **Two-level storage**: `~/.pi/agent/` (global: `rules.md`, `agent.md`) + `<project>/.pi/` (project: `memory.md`, `events/`, `runtime/threads/`)
-- **Three-layer injection**:
-  1. `resources_discover` → `promptPaths` for static base injection (rules + agent + memory at startup)
-  2. `before_agent_start` → injects dynamic `<Memory>` + `[Thread State]` block each prompt round
-  3. `context` → multi-source keyword recall (pending/ + memory.md + processed/), ranked by `score = confidence × decay(age)`, truncated to `TOKEN_BUDGET` (2000 tokens)
-- **`memory_log` tool**: append-only event logging to `events/pending/<date>-<thread-id>.md`
-- **`memory_search` tool**: on-demand search across all memory sources for long-tail retrieval
-- **`memory-consolidate` command**: exact dedup → fuzzy merge (same topic) → auto-write via `MemoryWriteQueue` (debounced 2s + atomic rename) → notify
-- **Short-term thread state**: `<project>/.pi/runtime/threads/<session-id>.json` — auto-saved on `turn_end` (task summary, temp findings, pending todos), auto-cleaned after 24h, injected into `[Thread State]` block each prompt round
-- **Auto-consolidate**: triggers on `turn_end` when pending file count >= 5
-- **Bash guard**: intercepts `bash`/`write`/`edit` tool calls targeting `rules.md`, blocks with read-only message
-
-### Extension Hooks Used
-
-| Hook | Purpose |
-|------|---------|
-| `resources_discover` | Provide `rules.md`, `agent.md`, `memory.md` paths to base system prompt |
-| `before_agent_start` | Assemble `<Memory>` block + `[Thread State]` from files + thread state |
-| `context` | Multi-source recall scored by confidence × decay(age), token-budget truncated |
-| `turn_end` | Save thread state + auto-consolidate when pending >= 5 files |
-| `tool_call` | Block writes to `rules.md` |
-| `session_shutdown` | Flush pending write queue |
+- **3 files**: `rules.md` (read-only), `profile.md` (user profile), `memory.md` (project + agent evolution)
+- **Injection**: `resources_discover` (paths) → `before_agent_start` (`<Memory>` + thread state) → `context` (keyword recall, confidence × decay, 2000-token budget)
+- **Pipeline**: `memory_log` → `events/pending/` → consolidate (dedup + fuzzy merge, `proper-lockfile` concurrency) → stable files
+- **Limits**: memory.md 8k/12k, profile.md 3k/5k (hard meltdown + drift detection)
 
 ### Tools
 
 | Tool | Description |
 |------|-------------|
-| `memory_log` | Append an event to pending/ with type/scope/confidence |
-| `memory_search` | Search all memory sources by keyword/topic for long-tail retrieval |
-| `/memory-consolidate` | Consolidate pending → stable files with dedup |
+| `memory_log` | Append event to pending/ with type/scope/confidence |
+| `memory_search` | Search all sources by keyword |
+| `memory_replace` | Replace content in pending events |
+| `memory_remove` | Remove event from pending/ |
+| `memory_edit` (internal) | Directly edit stable files with atomic backup |
+| `/memory-consolidate` | Lock-protected consolidate |
+| `/memory-view` | Show file sizes + limit status |
+| `/memory-clear` / `-project` / `-global` | Clear target files |
 
-### Internal Components
+### Hooks Used
 
-| Component | Role |
-|-----------|------|
-| `MemoryWriteQueue` | Debounce 2s writes + atomic temp→rename |
-| `consolidateEvents()` | Exact dedup → fuzzy merge (topic+type) → stable write |
-| `calculateScore()` | `confidence × 1/(1 + α·age_hours)` ranking |
-| `extractTopic()` | First 60 chars of content for fuzzy merge key |
-| `ThreadState` | `<project>/.pi/runtime/threads/<id>.json` — short-term session memory |
-| `saveThreadState()` / `loadThreadState()` | Persist/read thread state with auto-cleanup after 24h |
+`resources_discover`, `session_start` (migration), `before_agent_start`, `context`, `turn_end`, `tool_call` (rules.md guard), `session_shutdown`
+
+For full design doc, see `docs/architecture/memory-architecture.md`.
 
 ## Session System
 
@@ -203,22 +185,15 @@ JSONL storage with tree-based branching (fork/resume/navigate). Context compacti
 
 ## Session History
 
-### 2026-07-08: 欢迎页隐藏 Extensions 区块
+### 2026-07-08: 欢迎页隐藏 Extensions、Windows 中文输出解码
 
-- TUI 欢迎页 `showLoadedResources()` 不再打印 `[Extensions]` 分组，避免启动时显示已加载扩展列表。
-- 扩展加载、运行和扩展诊断仍保留；仅隐藏欢迎页 loaded-resources 列表中的扩展展示。
-- 新增回归测试覆盖存在扩展时不渲染 `[Extensions]` 和扩展文件名。
-
-### 2026-07-08: Windows 中文输出解码 + Context 维护规则
-
-- TUI bash 命令输出增加 GB18030 回退解码，解决 Windows 旧代码页中文乱码
-- AGENTS.md 新增 context.md 维护规则：中文对话 + 每次有意义变更后更新
+- TUI 欢迎页隐藏 Extensions 分组；bash 输出增加 GB18030 回退解码；AGENTS.md 新增 context.md 维护规则
 
 ### 2026-07-10: Plan Agent 优化 — 结构化提问、bash 白名单扩展、移除 Commit Agent
+- 新增 `plan_question` 工具；扩展 bash 白名单（readonly + safe git + pkg info）；Plan prompt 三阶段重构；移除已废弃 Commit Agent
 
-- 新增 `plan_question` 工具：Plan 模式专用结构化提问，1-3 个问题带可选预定义选项，替代自由文本提问
-- 注册 `plan_question` 到工具系统（ToolName/allToolNames/createToolDefinition/createTool/createAllTools）
-- 扩展 `plan-mode-policy.ts` bash 白名单：SAFE_READONLY_COMMANDS（cat/head/tail/wc/du/df/stat/env/uname/uptime 等），安全 git 子命令（status/log/diff/show/branch/tag/remote/stash），安全包管理器子命令（npm/pnpm/yarn list/ls/info/view/show/outdated/why/explain）
-- 更新 Plan prompt 为三阶段结构（Phase 1: Ground in Environment → Phase 2: Intent Alignment → Phase 3: Implementation Planning），使用 plan_question 替代自由提问
-- 移除已废弃的 Commit Agent 所有引用（docs 和代码注释）
-- 更新所有文档反映双 Agent 结构
+### 2026-07-11: Memory 扩展重构 — 3 文件结构 + 并发锁 + rewrite compact
+- agent.md 拆分为 profile.md（用户画像）+ 合并入 memory.md；注入块 `[Project Memory]` → `[Memory]`，`[Agent Memory]` → `[User Profile]`
+- `memory_replace`、`memory_remove`、`memory_edit`（公开为 LLM 工具）；`proper-lockfile` 防双会话并发覆盖
+- 字符上限：memory.md 8k/12k、profile.md 3k/5k，超硬上限熔断备份 + 漂移检测
+- 自动 consolidate 每 5 次执行 rewrite 模式（按 section 重组，标记 [compact]），无手动 compact 命令

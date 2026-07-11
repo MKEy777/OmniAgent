@@ -1,8 +1,9 @@
 import { existsSync } from "node:fs";
 import { appendFile, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { lock as acquireLock } from "proper-lockfile";
 import { Type } from "typebox";
 
 // ============================================================================
@@ -14,6 +15,13 @@ const TOKEN_BUDGET = 2000;
 const AUTO_CONSOLIDATE_THRESHOLD = 5;
 const RULES_GUARD_PATH = ".pi/agent/rules.md";
 
+const MEMORY_CHAR_LIMIT_SOFT = 8000;
+const MEMORY_CHAR_LIMIT_HARD = 12000;
+const PROFILE_CHAR_LIMIT_SOFT = 3000;
+const PROFILE_CHAR_LIMIT_HARD = 5000;
+
+const CONSOLIDATE_LOCK_PATH = ".pi/events/.consolidate.lock";
+
 const EVENT_TYPES = ["preference", "fact", "project", "agent", "history"] as const;
 const EVENT_SCOPES = ["user", "agent", "project"] as const;
 
@@ -24,9 +32,13 @@ type EventScope = (typeof EVENT_SCOPES)[number];
 // Helpers
 // ============================================================================
 
-function getGlobalDir(): string {
+function getAgentDir(): string {
 	const home = process.env.USERPROFILE ?? process.env.HOME ?? "";
 	return join(home, ".pi", "agent");
+}
+
+function getProjectDir(cwd: string): string {
+	return join(cwd, ".pi");
 }
 
 function getEventsDir(cwd: string, sub: string): string {
@@ -160,19 +172,19 @@ function stripEmptySections(content: string): string {
 	return result.join("\n");
 }
 
-function formatMemoryBlock(rules: string, projectMemory: string, agentMemory: string, recentEvents: string): string {
+function formatMemoryBlock(rules: string, profile: string, projectMemory: string, recentEvents: string): string {
 	const parts: string[] = ["<Memory>"];
 
 	if (rules.trim()) {
 		parts.push("[Rules]", rules.trim());
 	}
 
-	if (projectMemory.trim()) {
-		parts.push("[Project Memory]", projectMemory.trim());
+	if (profile.trim()) {
+		parts.push("[User Profile]", profile.trim());
 	}
 
-	if (agentMemory.trim()) {
-		parts.push("[Agent Memory]", agentMemory.trim());
+	if (projectMemory.trim()) {
+		parts.push("[Memory]", projectMemory.trim());
 	}
 
 	if (recentEvents.trim()) {
@@ -284,15 +296,108 @@ async function loadPendingEvents(cwd: string): Promise<PendingEvent[]> {
 // Consolidation logic (shared by command + auto-trigger)
 // ============================================================================
 
+function isPlausibleContent(text: string): boolean {
+	if (!text || text.length < 10) return false;
+	return /^#\s/.test(text.trim());
+}
+
+async function checkCharLimit(
+	path: string,
+	content: string,
+	hardLimit: number,
+	softLimit: number,
+): Promise<{ ok: boolean; message: string }> {
+	const len = content.length;
+	if (len > hardLimit) {
+		const backup = `${path}.bak.${Date.now()}`;
+		await rename(path, backup).catch(() => {});
+		return { ok: false, message: `Exceeds hard limit (${len}/${hardLimit}), backed up to ${basename(backup)}` };
+	}
+	if (len > softLimit) {
+		return { ok: true, message: `Exceeds soft limit (${len}/${softLimit})` };
+	}
+	return { ok: true, message: "" };
+}
+
+let _consolidateCount = 0;
+
+const REWRITE_INTERVAL = 5;
+
+function rebuildSections(
+	existing: string,
+	sectionInjections: Record<string, { newLines: string[]; defaultBody: string[] }>,
+): string {
+	const lines = existing.split("\n");
+	const sections: { header: string; body: string[]; isEmpty: boolean }[] = [];
+	let current: { header: string; body: string[]; isEmpty: boolean } | null = null;
+
+	for (const line of lines) {
+		if (/^##\s/.test(line)) {
+			if (current) sections.push(current);
+			const trimmed = line.trim();
+			current = { header: trimmed, body: [], isEmpty: true };
+		} else if (current) {
+			const t = line.trim();
+			// Detect placeholder lines like （占位符）
+			if (!/^[（(][^）)]*[）)]\s*$/.test(t) && t) {
+				current.isEmpty = false;
+			}
+			current.body.push(line);
+		}
+	}
+	if (current) sections.push(current);
+
+	for (const [header, injection] of Object.entries(sectionInjections)) {
+		let matched = false;
+		for (const section of sections) {
+			if (section.header === `## ${header}` || section.header === header.replace(/^##\s*/, "## ")) {
+				const existingBullets = section.body.filter((l) => /^- \[/.test(l.trim()));
+				for (const line of injection.newLines) {
+					if (!existingBullets.some((b) => b.trim() === line.trim())) {
+						if (section.isEmpty && existingBullets.length === 0) {
+							section.body = section.body.filter((l) => l.trim() && !/^[（(]/.test(l.trim()));
+						}
+						section.body.push(line);
+						section.isEmpty = false;
+					}
+				}
+				matched = true;
+				break;
+			}
+		}
+		if (!matched) {
+			sections.push({
+				header: `## ${header}`,
+				body: [...injection.defaultBody, ...injection.newLines],
+				isEmpty: false,
+			});
+		}
+	}
+
+	const result: string[] = [];
+	let first = true;
+	for (const s of sections) {
+		if (first) first = false;
+		else result.push("");
+		result.push(s.header);
+		for (const line of s.body) {
+			if (line.trim()) result.push(line);
+		}
+	}
+	result.push("");
+	return result.join("\n");
+}
+
 async function consolidateEvents(
 	cwd: string,
-	projectEvents: PendingEvent[],
-	agentEvents: PendingEvent[],
+	memEvents: PendingEvent[],
+	userEvents: PendingEvent[],
 	queue: MemoryWriteQueue,
-): Promise<{ total: number; project: number; agent: number }> {
+	rewrite: boolean,
+): Promise<{ total: number; memory: number; profile: number }> {
 	// Step 1: exact dedup (same content + type → keep latest timestamp)
 	const exactMap = new Map<string, PendingEvent>();
-	for (const ev of [...projectEvents, ...agentEvents]) {
+	for (const ev of [...memEvents, ...userEvents]) {
 		const key = `${ev.type}|${ev.content}`;
 		const existing = exactMap.get(key);
 		if (!existing || new Date(ev.timestamp) > new Date(existing.timestamp)) {
@@ -309,7 +414,6 @@ async function consolidateEvents(
 		if (!existing) {
 			fuzzyMap.set(fkey, ev);
 		} else if (fkey !== `${ev.type}|${ev.content}`) {
-			// Merge: keep higher confidence, newer timestamp, merge content
 			if (ev.confidence > existing.confidence) {
 				existing.confidence = ev.confidence;
 			}
@@ -324,31 +428,103 @@ async function consolidateEvents(
 
 	const merged = [...fuzzyMap.values()];
 	const pEvents = merged.filter((e) => e.scope === "project");
-	const aEvents = merged.filter((e) => e.scope === "agent" || e.scope === "user");
+	const aEvents = merged.filter((e) => e.scope === "agent");
+	const uEvents = merged.filter((e) => e.scope === "user");
 
-	const projectDir = join(cwd, ".pi");
-	const globalDir = getGlobalDir();
+	const projectDir = getProjectDir(cwd);
+	const agentDir = getAgentDir();
 	await ensureDir(projectDir);
-	await ensureDir(join(globalDir));
+	await ensureDir(agentDir);
 
-	if (pEvents.length > 0) {
+	// Write memory.md (project + agent scope)
+	const needsMem = pEvents.length > 0 || aEvents.length > 0;
+	if (needsMem) {
 		const pLines = pEvents.map((e) => `- [${e.confidence}] ${e.content}`);
-		const pPath = join(projectDir, "memory.md");
-		const existing = existsSync(pPath) ? await readFile(pPath, "utf-8").catch(() => "") : "";
-		const updated = existing
-			? `${existing.trim()}\n${pLines.join("\n")}\n`
-			: `# Project Memory\n\n## Background\n（项目是什么：目标、核心模块、当前状态、业务背景）\n\n## Tech Stack\n（项目用什么：框架、语言、依赖、运行方式、构建方式）\n\n## Decisions\n（为什么这么做：架构决策、历史取舍、已踩坑、不再采用的方案）\n\n## Facts\n${pLines.join("\n")}\n\n## History Summaries\n（历史会话摘要）\n`;
-		queue.enqueue(pPath, updated);
+		const aLines = aEvents.map((e) => `- [${e.confidence}] ${e.content}`);
+		const memPath = join(projectDir, "memory.md");
+		const existing = existsSync(memPath) ? await readFile(memPath, "utf-8").catch(() => "") : "";
+
+		let updated: string;
+		if (existing && !rewrite) {
+			const parts: string[] = [existing.trim()];
+			if (pLines.length) parts.push(...pLines);
+			if (aLines.length) parts.push(...aLines);
+			updated = `${parts.join("\n")}\n`;
+		} else if (existing && rewrite) {
+			updated = rebuildSections(existing, {
+				Facts: { newLines: pLines, defaultBody: [] },
+				"Agent Self-Evolution": { newLines: aLines, defaultBody: [] },
+			});
+		} else {
+			const sections: string[] = [
+				"# Project Memory",
+				"",
+				"## Background",
+				"（项目是什么：目标、核心模块、当前状态、业务背景）",
+				"",
+				"## Tech Stack",
+				"（项目用什么：框架、语言、依赖、运行方式、构建方式）",
+				"",
+				"## Decisions",
+				"（为什么这么做：架构决策、历史取舍、已踩坑、不再采用的方案）",
+				"",
+				"## Facts",
+			];
+			if (pLines.length) sections.push(...pLines);
+			if (aLines.length) {
+				sections.push("", "## Agent Self-Evolution");
+				sections.push(...aLines);
+			}
+			sections.push("", "## History Summaries", "（历史会话摘要）", "");
+			updated = sections.join("\n");
+		}
+
+		// Drift detection
+		if (!isPlausibleContent(updated)) {
+			const backup = `${memPath}.bak.${Date.now()}`;
+			await rename(memPath, backup).catch(() => {});
+			return { total: 0, memory: 0, profile: 0 };
+		}
+
+		// Char limit check
+		const limit = await checkCharLimit(memPath, updated, MEMORY_CHAR_LIMIT_HARD, MEMORY_CHAR_LIMIT_SOFT);
+		if (!limit.ok) {
+			queue.enqueue(memPath, `# Project Memory\n\n## ERROR\nConsolidation blocked: ${limit.message}\n`);
+			return { total: 0, memory: 0, profile: 0 };
+		}
+		queue.enqueue(memPath, updated);
 	}
 
-	if (aEvents.length > 0) {
-		const aLines = aEvents.map((e) => `- [${e.confidence}] ${e.content}`);
-		const aPath = join(globalDir, "agent.md");
-		const existing = existsSync(aPath) ? await readFile(aPath, "utf-8").catch(() => "") : "";
-		const updated = existing
-			? `${existing.trim()}\n${aLines.join("\n")}\n`
-			: `# Agent Self-Evolution Memory\n\n## Working Patterns\n${aLines.join("\n")}\n\n## Coding Lessons\n（编码经验、踩坑、可复用解法）\n\n## Planning Lessons\n（任务拆解、规划经验）\n\n## Failure Cases\n（失败案例与正确做法）\n\n## User Interaction Lessons\n（与用户协作、沟通的经验）\n`;
-		queue.enqueue(aPath, updated);
+	// Write profile.md (user scope)
+	const needsProfile = uEvents.length > 0;
+	if (needsProfile) {
+		const uLines = uEvents.map((e) => `- [${e.confidence}] ${e.content}`);
+		const profilePath = join(agentDir, "profile.md");
+		const existing = existsSync(profilePath) ? await readFile(profilePath, "utf-8").catch(() => "") : "";
+
+		let updated: string;
+		if (existing && !rewrite) {
+			updated = `${existing.trim()}\n${uLines.join("\n")}\n`;
+		} else if (existing && rewrite) {
+			updated = rebuildSections(existing, {
+				Preferences: { newLines: uLines, defaultBody: [] },
+			});
+		} else {
+			updated = `# User Profile\n\n## Preferences\n${uLines.join("\n")}\n\n## Communication Style\n（用户的沟通偏好）\n\n## Habits\n（用户的工作习惯）\n`;
+		}
+
+		if (!isPlausibleContent(updated)) {
+			const backup = `${profilePath}.bak.${Date.now()}`;
+			await rename(profilePath, backup).catch(() => {});
+			return { total: 0, memory: 0, profile: 0 };
+		}
+
+		const limit = await checkCharLimit(profilePath, updated, PROFILE_CHAR_LIMIT_HARD, PROFILE_CHAR_LIMIT_SOFT);
+		if (!limit.ok) {
+			queue.enqueue(profilePath, `# User Profile\n\n## ERROR\nConsolidation blocked: ${limit.message}\n`);
+			return { total: 0, memory: 0, profile: 0 };
+		}
+		queue.enqueue(profilePath, updated);
 	}
 
 	// Move pending → processed
@@ -363,7 +539,7 @@ async function consolidateEvents(
 		}
 	}
 
-	return { total: merged.length, project: pEvents.length, agent: aEvents.length };
+	return { total: merged.length, memory: pEvents.length + aEvents.length, profile: uEvents.length };
 }
 
 // ============================================================================
@@ -437,17 +613,57 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// --------------------------------------------------------------------------
-	// 2. resources_discover: inject static memory files into base system prompt
-	// NOTE: agent.md is excluded from promptPaths to prevent the user
-	// from accidentally sending memory content as a message (which triggers
-	// unwanted agent exploration). It is still injected via before_agent_start.
+	// 2. session_start: migrate agent.md → profile.md + memory.md
+	// --------------------------------------------------------------------------
+	pi.on("session_start", async () => {
+		const agentDir = getAgentDir();
+		const agentMdPath = join(agentDir, "agent.md");
+		const sentinelPath = join(agentDir, ".agent.md.migrated");
+		const projectDir = getProjectDir(process.cwd());
+
+		if (!existsSync(agentMdPath) || existsSync(sentinelPath)) return;
+
+		const content = await readFile(agentMdPath, "utf-8").catch(() => "");
+		if (!content) return;
+
+		await ensureDir(projectDir);
+		await ensureDir(agentDir);
+
+		// Append agent.md content to memory.md under ## Agent Self-Evolution
+		const memPath = join(projectDir, "memory.md");
+		const memExisting = existsSync(memPath) ? await readFile(memPath, "utf-8").catch(() => "") : "";
+		const memUpdated = memExisting
+			? `${memExisting.trimEnd()}\n\n## Agent Self-Evolution\n\n${content.trim()}\n`
+			: `# Project Memory\n\n## Agent Self-Evolution\n\n${content.trim()}\n`;
+		await writeFile(memPath, memUpdated, "utf-8");
+
+		// Create empty profile.md
+		const profilePath = join(agentDir, "profile.md");
+		if (!existsSync(profilePath)) {
+			await writeFile(
+				profilePath,
+				"# User Profile\n\n## Preferences\n（用户的偏好、风格、习惯）\n\n## Communication Style\n（沟通偏好）\n\n## Habits\n（工作习惯）\n",
+				"utf-8",
+			);
+		}
+
+		// Mark migrated
+		await rename(agentMdPath, join(agentDir, "agent.md.migrated")).catch(() => {});
+		await writeFile(sentinelPath, new Date().toISOString(), "utf-8");
+	});
+
+	// --------------------------------------------------------------------------
+	// 3. resources_discover: inject static memory files into base system prompt
 	// --------------------------------------------------------------------------
 	pi.on("resources_discover", async (event) => {
 		const paths: string[] = [];
-		const globalDir = getGlobalDir();
+		const agentDir = getAgentDir();
 
-		const rulesPath = join(globalDir, "rules.md");
+		const rulesPath = join(agentDir, "rules.md");
 		if (existsSync(rulesPath)) paths.push(rulesPath);
+
+		const profilePath = join(agentDir, "profile.md");
+		if (existsSync(profilePath)) paths.push(profilePath);
 
 		const projectDir = join(event.cwd, ".pi");
 		const memoryPath = join(projectDir, "memory.md");
@@ -457,22 +673,23 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// --------------------------------------------------------------------------
-	// 3. before_agent_start: inject dynamic <Memory> block each prompt round
+	// 4. before_agent_start: inject dynamic <Memory> block each prompt round
 	// --------------------------------------------------------------------------
 	pi.on("before_agent_start", async (event, ctx) => {
 		const projectDir = join(ctx.cwd, ".pi");
-		const globalDir = getGlobalDir();
+		const agentDir = getAgentDir();
 		const pendingDir = getEventsDir(ctx.cwd, "pending");
 
-		// Read static files
 		const readOpts = { encoding: "utf-8" as const };
 
-		const [rules, projectMemory, agentMemory] = await Promise.all([
-			existsSync(join(globalDir, "rules.md")) ? readFile(join(globalDir, "rules.md"), readOpts).catch(() => "") : "",
+		const [rules, profile, projectMemory] = await Promise.all([
+			existsSync(join(agentDir, "rules.md")) ? readFile(join(agentDir, "rules.md"), readOpts).catch(() => "") : "",
+			existsSync(join(agentDir, "profile.md"))
+				? readFile(join(agentDir, "profile.md"), readOpts).catch(() => "")
+				: "",
 			existsSync(join(projectDir, "memory.md"))
 				? readFile(join(projectDir, "memory.md"), readOpts).catch(() => "")
 				: "",
-			existsSync(join(globalDir, "agent.md")) ? readFile(join(globalDir, "agent.md"), readOpts).catch(() => "") : "",
 		]);
 
 		// Read recent pending events (last 3 files)
@@ -498,7 +715,12 @@ export default function (pi: ExtensionAPI) {
 			if (parts.length) threadBlock = `[Thread State]\n${parts.join("\n")}`;
 		}
 
-		const memoryBlock = formatMemoryBlock(rules, projectMemory, stripEmptySections(agentMemory), recentEvents);
+		const memoryBlock = formatMemoryBlock(
+			rules,
+			stripEmptySections(profile),
+			stripEmptySections(projectMemory),
+			recentEvents,
+		);
 		const fullBlock = threadBlock ? `${memoryBlock}\n\n${threadBlock}` : memoryBlock;
 		if (!fullBlock.includes("]")) return;
 
@@ -506,7 +728,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// --------------------------------------------------------------------------
-	// 4. context: score-ranked dynamic recall with token budget
+	// 5. context: score-ranked dynamic recall with token budget
 	//    Scans all pending/, memory.md, events/processed/ for keyword matches.
 	//    Ranks by score = confidence × decay(age), truncates to TOKEN_BUDGET.
 	// --------------------------------------------------------------------------
@@ -614,13 +836,13 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// --------------------------------------------------------------------------
-	// 5. memory_search: long-tail on-demand memory retrieval
+	// 6. memory_search: long-tail on-demand memory retrieval
 	// --------------------------------------------------------------------------
 	pi.registerTool({
 		name: "memory_search",
 		label: "Memory Search",
 		description:
-			"Search across all memory sources (memory.md, agent.md, events/pending/, events/processed/) by keyword or topic. Use for long-tail memory not already injected in context. Use specific keyword(s) as the query, for example 'Vitest' or 'TypeScript' or '2 空格'. Chinese 2-character keywords work too.",
+			"Search across all memory sources (memory.md, profile.md, events/pending/, events/processed/) by keyword or topic. Use for long-tail memory not already injected in context. Use specific keyword(s) as the query, for example 'Vitest' or 'TypeScript' or '2 空格'. Chinese 2-character keywords work too.",
 		promptSnippet: "memory_search: search project memory, agent experience, and event logs by topic",
 		parameters: Type.Object({
 			query: Type.String({ description: "Keyword or topic to search for in memory" }),
@@ -648,13 +870,13 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			// Search agent.md
-			const globalDir = getGlobalDir();
-			const agentPath = join(globalDir, "agent.md");
-			if (existsSync(agentPath)) {
-				const content = await readFile(agentPath, readOpts).catch(() => "");
+			// Search profile.md
+			const agentDir = getAgentDir();
+			const profilePath = join(agentDir, "profile.md");
+			if (existsSync(profilePath)) {
+				const content = await readFile(profilePath, readOpts).catch(() => "");
 				if (content && keywordMatch(content, keywords)) {
-					results.push({ source: "agent.md", content });
+					results.push({ source: "profile.md", content });
 				}
 			}
 
@@ -711,7 +933,137 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// --------------------------------------------------------------------------
-	// 6. memory-consolidate command
+	// 6. memory_replace: replace content in pending events
+	// --------------------------------------------------------------------------
+	pi.registerTool({
+		name: "memory_replace",
+		label: "Memory Replace",
+		description:
+			"Replace content of a pending event by matching text. Searches events/pending/ for an event whose content contains oldText and replaces it with newContent.",
+		promptSnippet: "memory_replace: fix or update a pending memory event",
+		parameters: Type.Object({
+			oldText: Type.String({ description: "Text to find in event content (substring match)" }),
+			newContent: Type.String({ description: "Replacement content" }),
+		}),
+		execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+			const pendingDir = getEventsDir(ctx.cwd, "pending");
+			if (!existsSync(pendingDir)) {
+				return { details: undefined, content: [{ type: "text" as const, text: "No pending events to modify." }] };
+			}
+
+			const files = await readdir(pendingDir);
+			let replaced = false;
+			for (const f of files) {
+				if (!f.endsWith(".md")) continue;
+				const fpath = join(pendingDir, f);
+				const content = await readFile(fpath, "utf-8").catch(() => "");
+				if (!content || !content.includes(params.oldText)) continue;
+
+				const updated = content.replace(/(content:\n)((?:- .*\n?)*)/g, (match, prefix, body) => {
+					if (body.includes(params.oldText)) {
+						replaced = true;
+						return `${prefix}- ${params.newContent.split("\n").join("\n  ")}\n`;
+					}
+					return match;
+				});
+
+				if (updated !== content) {
+					await writeFile(fpath, updated, "utf-8");
+				}
+			}
+
+			return {
+				details: undefined,
+				content: [{ type: "text" as const, text: replaced ? "Event replaced." : "No matching event found." }],
+			};
+		},
+	});
+
+	// --------------------------------------------------------------------------
+	// 7. memory_remove: remove a pending event by matching text
+	// --------------------------------------------------------------------------
+	pi.registerTool({
+		name: "memory_remove",
+		label: "Memory Remove",
+		description:
+			"Remove a pending event by matching text. Searches events/pending/ for an event whose content contains oldText and removes the entire event block.",
+		promptSnippet: "memory_remove: delete a pending memory event",
+		parameters: Type.Object({
+			oldText: Type.String({ description: "Text to find in event content (substring match)" }),
+		}),
+		execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+			const pendingDir = getEventsDir(ctx.cwd, "pending");
+			if (!existsSync(pendingDir)) {
+				return { details: undefined, content: [{ type: "text" as const, text: "No pending events to modify." }] };
+			}
+
+			const files = await readdir(pendingDir);
+			let removed = false;
+			for (const f of files) {
+				if (!f.endsWith(".md")) continue;
+				const fpath = join(pendingDir, f);
+				const content = await readFile(fpath, "utf-8").catch(() => "");
+				if (!content || !content.includes(params.oldText)) continue;
+
+				// Remove event blocks containing oldText
+				const blocks = content.split(/\n(?=## )/);
+				const filtered = blocks.filter((b) => !b.includes(params.oldText));
+				if (filtered.length !== blocks.length) {
+					removed = true;
+					await writeFile(fpath, filtered.join(""), "utf-8");
+				}
+			}
+
+			return {
+				details: undefined,
+				content: [{ type: "text" as const, text: removed ? "Event removed." : "No matching event found." }],
+			};
+		},
+	});
+
+	// --------------------------------------------------------------------------
+	// 8. memory_edit: directly edit stable memory files (LLM tool)
+	// --------------------------------------------------------------------------
+	pi.registerTool({
+		name: "memory_edit",
+		label: "Memory Edit",
+		description:
+			"Directly edit stable memory files (memory.md or profile.md) with atomic backup. Use to correct or replace consolidated content that cannot be changed via memory_log/memory_replace.",
+		promptSnippet: "memory_edit: directly overwrite memory.md or profile.md content",
+		parameters: Type.Object({
+			target: StringEnum(["memory", "profile"] as const),
+			content: Type.String({ description: "Full new content for the file" }),
+		}),
+		execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+			const path =
+				params.target === "profile" ? join(getAgentDir(), "profile.md") : join(getProjectDir(ctx.cwd), "memory.md");
+
+			await ensureDir(getAgentDir());
+
+			const existing = existsSync(path) ? await readFile(path, "utf-8").catch(() => "") : "";
+			if (existing) {
+				const backup = `${path}.bak.${Date.now()}`;
+				await rename(path, backup).catch(() => {});
+			}
+
+			const tmp = `${path}.tmp.${process.pid}`;
+			await writeFile(tmp, params.content, "utf-8");
+			await rename(tmp, path);
+
+			return {
+				details: undefined,
+				content: [
+					{
+						type: "text" as const,
+						text: `${params.target === "profile" ? "Profile" : "Memory"} updated directly (backup created) / 已直接编辑${params.target === "profile" ? "用户画像" : "项目记忆"}（已备份原文件）`,
+					},
+				],
+			};
+		},
+	});
+
+	// --------------------------------------------------------------------------
+	// 9. memory-consolidate command
 	// --------------------------------------------------------------------------
 	async function doConsolidate(ctx: {
 		cwd: string;
@@ -729,33 +1081,49 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		const projectEvents = events.filter((e) => e.scope === "project");
-		const agentEvents = events.filter((e) => e.scope === "agent" || e.scope === "user");
-		const result = await consolidateEvents(ctx.cwd, projectEvents, agentEvents, writeQueue);
-		await writeQueue.flushAll();
-		ctx.ui.notify(
-			`Consolidated ${result.total} events / 已整合 ${result.total} 条事件 (项目 ${result.project}, 全局 ${result.agent})`,
-			"info",
-		);
+		const lockPath = join(ctx.cwd, CONSOLIDATE_LOCK_PATH);
+		let release: (() => Promise<void>) | undefined;
+		try {
+			release = await acquireLock(lockPath, { realpath: false, retries: 3, stale: 5000 });
+		} catch {
+			ctx.ui.notify("Another session is consolidating, try later / 其他会话正在整合，请稍后重试", "warning");
+			return;
+		}
+
+		try {
+			const memEvents = events.filter((e) => e.scope === "project" || e.scope === "agent");
+			const userEvents = events.filter((e) => e.scope === "user");
+			const result = await consolidateEvents(ctx.cwd, memEvents, userEvents, writeQueue, false);
+			await writeQueue.flushAll();
+			ctx.ui.notify(
+				`Consolidated ${result.total} events / 已整合 ${result.total} 条事件 (memory ${result.memory}, profile ${result.profile})`,
+				"info",
+			);
+		} finally {
+			if (release) await release().catch(() => {});
+		}
 	}
 
 	pi.registerCommand("memory-consolidate", {
 		description:
-			"Consolidate pending events into stable memory files / 整合待处理事件到稳定记忆文件 memory.md / agent.md",
+			"Consolidate pending events into stable memory files / 整合待处理事件到稳定记忆文件 memory.md / profile.md",
 		handler: async (_args, ctx) => doConsolidate(ctx),
 	});
 
-	async function doClear(ctx: { cwd: string; ui: { notify: (msg: string, type?: string) => void } }) {
+	async function doClear(ctx: {
+		cwd: string;
+		ui: { notify: (msg: string, type?: "error" | "info" | "warning") => void };
+	}) {
 		const projectDir = join(ctx.cwd, ".pi");
-		const globalDir = getGlobalDir();
+		const agentDir = getAgentDir();
 		await ensureDir(projectDir);
-		await ensureDir(globalDir);
+		await ensureDir(agentDir);
 
 		const emptyMemory = `# Project Memory\n\n## Background\n（项目是什么：目标、核心模块、当前状态、业务背景）\n\n## Tech Stack\n（项目用什么：框架、语言、依赖、运行方式、构建方式）\n\n## Decisions\n（为什么这么做：架构决策、历史取舍、已踩坑、不再采用的方案）\n\n## Facts\n（长期事实，可按 confidence 标注）\n\n## History Summaries\n（历史会话摘要）\n`;
 		await writeFile(join(projectDir, "memory.md"), emptyMemory, "utf-8");
 
-		const emptyAgent = `# Agent Self-Evolution Memory\n\n## Working Patterns\n（通用工作模式）\n\n## Coding Lessons\n（编码经验、踩坑、可复用解法）\n\n## Planning Lessons\n（任务拆解、规划经验）\n\n## Failure Cases\n（失败案例与正确做法）\n\n## User Interaction Lessons\n（与用户协作、沟通的经验）\n`;
-		await writeFile(join(globalDir, "agent.md"), emptyAgent, "utf-8");
+		const emptyProfile = `# User Profile\n\n## Preferences\n（用户的偏好、风格、习惯）\n\n## Communication Style\n（沟通偏好）\n\n## Habits\n（工作习惯）\n`;
+		await writeFile(join(agentDir, "profile.md"), emptyProfile, "utf-8");
 
 		for (const sub of ["pending", "processed"]) {
 			const dir = getEventsDir(ctx.cwd, sub);
@@ -787,11 +1155,14 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("memory-clear", {
-		description: "Clear all memory / 清空所有记忆（memory.md / agent.md / events / threads）",
+		description: "Clear all memory / 清空所有记忆（memory.md / profile.md / events / threads）",
 		handler: async (_args, ctx) => doClear(ctx),
 	});
 
-	async function doClearProject(ctx: { cwd: string; ui: { notify: (msg: string, type?: string) => void } }) {
+	async function doClearProject(ctx: {
+		cwd: string;
+		ui: { notify: (msg: string, type?: "error" | "info" | "warning") => void };
+	}) {
 		const projectDir = join(ctx.cwd, ".pi");
 		await ensureDir(projectDir);
 		const emptyMemory = `# Project Memory\n\n## Background\n（项目是什么：目标、核心模块、当前状态、业务背景）\n\n## Tech Stack\n（项目用什么：框架、语言、依赖、运行方式、构建方式）\n\n## Decisions\n（为什么这么做：架构决策、历史取舍、已踩坑、不再采用的方案）\n\n## Facts\n（长期事实，可按 confidence 标注）\n\n## History Summaries\n（历史会话摘要）\n`;
@@ -799,12 +1170,15 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify("Project memory cleared / 已清空项目记忆", "info");
 	}
 
-	async function doClearGlobal(ctx: { cwd: string; ui: { notify: (msg: string, type?: string) => void } }) {
-		const globalDir = getGlobalDir();
-		await ensureDir(globalDir);
-		const emptyAgent = `# Agent Self-Evolution Memory\n\n## Working Patterns\n（通用工作模式）\n\n## Coding Lessons\n（编码经验、踩坑、可复用解法）\n\n## Planning Lessons\n（任务拆解、规划经验）\n\n## Failure Cases\n（失败案例与正确做法）\n\n## User Interaction Lessons\n（与用户协作、沟通的经验）\n`;
-		await writeFile(join(globalDir, "agent.md"), emptyAgent, "utf-8");
-		ctx.ui.notify("Global agent memory cleared / 已清空全局 Agent 记忆", "info");
+	async function doClearGlobal(ctx: {
+		cwd: string;
+		ui: { notify: (msg: string, type?: "error" | "info" | "warning") => void };
+	}) {
+		const agentDir = getAgentDir();
+		await ensureDir(agentDir);
+		const emptyProfile = `# User Profile\n\n## Preferences\n（用户的偏好、风格、习惯）\n\n## Communication Style\n（沟通偏好）\n\n## Habits\n（工作习惯）\n`;
+		await writeFile(join(agentDir, "profile.md"), emptyProfile, "utf-8");
+		ctx.ui.notify("Global profile cleared / 已清空用户画像", "info");
 	}
 
 	pi.registerCommand("memory-clear-project", {
@@ -812,12 +1186,60 @@ export default function (pi: ExtensionAPI) {
 		handler: async (_args, ctx) => doClearProject(ctx),
 	});
 	pi.registerCommand("memory-clear-global", {
-		description: "Clear global agent memory / 清空全局 Agent 记忆（agent.md）",
+		description: "Clear user profile / 清空用户画像（profile.md）",
 		handler: async (_args, ctx) => doClearGlobal(ctx),
 	});
 
 	// --------------------------------------------------------------------------
-	// 7. Auto-consolidate: triggered when pending file count >= threshold
+	// 10. memory-view: show memory file status
+	// --------------------------------------------------------------------------
+	pi.registerCommand("memory-view", {
+		description: "Show memory file sizes and counts / 查看记忆文件状态",
+		handler: async (_args, ctx) => {
+			const projectDir = getProjectDir(ctx.cwd);
+			const agentDir = getAgentDir();
+			const pendingDir = getEventsDir(ctx.cwd, "pending");
+			const processedDir = getEventsDir(ctx.cwd, "processed");
+
+			const lines: string[] = [];
+
+			async function statFile(label: string, path: string, soft: number, hard: number) {
+				if (!existsSync(path)) {
+					lines.push(`${label}: not found`);
+					return;
+				}
+				const content = await readFile(path, "utf-8").catch(() => "");
+				const len = content.length;
+				const lineCount = content.split("\n").length;
+				const pct = len > 0 ? ` (${((len / soft) * 100).toFixed(0)}% of soft limit)` : "";
+				lines.push(`${label}: ${len} chars, ${lineCount} lines${pct}`);
+				if (len > hard) lines.push(`  WARNING: exceeds hard limit (${hard})`);
+				else if (len > soft) lines.push(`  NOTE: exceeds soft limit (${soft})`);
+			}
+
+			await statFile("memory.md", join(projectDir, "memory.md"), MEMORY_CHAR_LIMIT_SOFT, MEMORY_CHAR_LIMIT_HARD);
+			await statFile("profile.md", join(agentDir, "profile.md"), PROFILE_CHAR_LIMIT_SOFT, PROFILE_CHAR_LIMIT_HARD);
+
+			if (existsSync(pendingDir)) {
+				const files = (await readdir(pendingDir)).filter((f) => f.endsWith(".md"));
+				lines.push(`events/pending/: ${files.length} files`);
+			} else {
+				lines.push("events/pending/: not found");
+			}
+
+			if (existsSync(processedDir)) {
+				const files = (await readdir(processedDir)).filter((f) => f.endsWith(".md"));
+				lines.push(`events/processed/: ${files.length} files`);
+			} else {
+				lines.push("events/processed/: not found");
+			}
+
+			ctx.ui.notify(lines.join("\n"), "info");
+		},
+	});
+
+	// --------------------------------------------------------------------------
+	// 11. Auto-consolidate: triggered when pending file count >= threshold
 	//    Also saves thread state (short-term session memory) on each turn.
 	// --------------------------------------------------------------------------
 	pi.on("turn_end", async (_event, ctx) => {
@@ -865,25 +1287,40 @@ export default function (pi: ExtensionAPI) {
 			pendingTodos: pendingTodos.length > 0 ? pendingTodos.slice(0, 5) : undefined,
 		});
 
-		// Auto-consolidate check
+		// Auto-consolidate check with lock
 		const pendingDir = getEventsDir(ctx.cwd, "pending");
 		if (!existsSync(pendingDir)) return;
 
 		const events = await loadPendingEvents(ctx.cwd);
 		if (events.length < AUTO_CONSOLIDATE_THRESHOLD) return;
 
-		const projectEvents = events.filter((e) => e.scope === "project");
-		const agentEvents = events.filter((e) => e.scope === "agent" || e.scope === "user");
-		const result = await consolidateEvents(ctx.cwd, projectEvents, agentEvents, writeQueue);
-		await writeQueue.flushAll();
-		ctx.ui.notify(
-			`Auto-consolidated ${result.total} events / 自动整合 ${result.total} 条事件 (项目 ${result.project}, 全局 ${result.agent})`,
-			"info",
-		);
+		const lockPath = join(ctx.cwd, CONSOLIDATE_LOCK_PATH);
+		let release: (() => Promise<void>) | undefined;
+		try {
+			release = await acquireLock(lockPath, { realpath: false, retries: 0, stale: 5000 });
+		} catch {
+			return; // another session consolidating, skip
+		}
+
+		try {
+			const memEvents = events.filter((e) => e.scope === "project" || e.scope === "agent");
+			const userEvents = events.filter((e) => e.scope === "user");
+			_consolidateCount++;
+			const rewrite = _consolidateCount % REWRITE_INTERVAL === 0;
+			const result = await consolidateEvents(ctx.cwd, memEvents, userEvents, writeQueue, rewrite);
+			await writeQueue.flushAll();
+			const tag = rewrite ? " [compact]" : "";
+			ctx.ui.notify(
+				`Auto-consolidated ${result.total} events / 自动整合 ${result.total} 条事件 (memory ${result.memory}, profile ${result.profile})${tag}`,
+				"info",
+			);
+		} finally {
+			if (release) await release().catch(() => {});
+		}
 	});
 
 	// --------------------------------------------------------------------------
-	// 8. Bash guard: prevent writes to rules.md (reads allowed)
+	// 12. Bash guard: prevent writes to rules.md (reads allowed)
 	// --------------------------------------------------------------------------
 	pi.on("tool_call", async (event) => {
 		if (event.toolName !== "bash" && event.toolName !== "write" && event.toolName !== "edit") return;
@@ -911,7 +1348,7 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	// 9. session_shutdown: flush pending writes and clean up thread state
+	// 13. session_shutdown: flush pending writes
 	pi.on("session_shutdown", async () => {
 		await writeQueue.flushAll();
 	});
