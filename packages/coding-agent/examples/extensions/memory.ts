@@ -129,6 +129,37 @@ async function removeThreadState(cwd: string, sessionId: string): Promise<void> 
 // Content template helpers
 // ============================================================================
 
+/** Strip empty placeholder sections (e.g. "## Section\n（占位符）") from agent memory */
+function stripEmptySections(content: string): string {
+	const lines = content.split("\n");
+	const result: string[] = [];
+	const placeholderRE = /^[（(][^）)]*[）)]\s*$/;
+	let skipNextHeading = false;
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i];
+		const isHeading = /^##\s/.test(line);
+		const isPlaceholder = placeholderRE.test(line.trim());
+		if (isHeading) {
+			// Check if next non-empty line is a placeholder
+			let nextNonEmpty = "";
+			for (let j = i + 1; j < lines.length; j++) {
+				if (lines[j].trim()) {
+					nextNonEmpty = lines[j].trim();
+					break;
+				}
+			}
+			if (nextNonEmpty && placeholderRE.test(nextNonEmpty)) {
+				skipNextHeading = true;
+				continue;
+			}
+			skipNextHeading = false;
+		}
+		if (skipNextHeading || isPlaceholder) continue;
+		result.push(line);
+	}
+	return result.join("\n");
+}
+
 function formatMemoryBlock(rules: string, projectMemory: string, agentMemory: string, recentEvents: string): string {
 	const parts: string[] = ["<Memory>"];
 
@@ -407,15 +438,16 @@ export default function (pi: ExtensionAPI) {
 
 	// --------------------------------------------------------------------------
 	// 2. resources_discover: inject static memory files into base system prompt
+	// NOTE: agent.md is excluded from promptPaths to prevent the user
+	// from accidentally sending memory content as a message (which triggers
+	// unwanted agent exploration). It is still injected via before_agent_start.
 	// --------------------------------------------------------------------------
 	pi.on("resources_discover", async (event) => {
 		const paths: string[] = [];
 		const globalDir = getGlobalDir();
 
 		const rulesPath = join(globalDir, "rules.md");
-		const agentPath = join(globalDir, "agent.md");
 		if (existsSync(rulesPath)) paths.push(rulesPath);
-		if (existsSync(agentPath)) paths.push(agentPath);
 
 		const projectDir = join(event.cwd, ".pi");
 		const memoryPath = join(projectDir, "memory.md");
@@ -466,7 +498,7 @@ export default function (pi: ExtensionAPI) {
 			if (parts.length) threadBlock = `[Thread State]\n${parts.join("\n")}`;
 		}
 
-		const memoryBlock = formatMemoryBlock(rules, projectMemory, agentMemory, recentEvents);
+		const memoryBlock = formatMemoryBlock(rules, projectMemory, stripEmptySections(agentMemory), recentEvents);
 		const fullBlock = threadBlock ? `${memoryBlock}\n\n${threadBlock}` : memoryBlock;
 		if (!fullBlock.includes("]")) return;
 
@@ -708,7 +740,8 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("memory-consolidate", {
-		description: "Consolidate pending events into stable memory files / 整合待处理事件到稳定记忆文件 memory.md / agent.md",
+		description:
+			"Consolidate pending events into stable memory files / 整合待处理事件到稳定记忆文件 memory.md / agent.md",
 		handler: async (_args, ctx) => doConsolidate(ctx),
 	});
 
@@ -729,7 +762,11 @@ export default function (pi: ExtensionAPI) {
 			if (existsSync(dir)) {
 				const files = await readdir(dir);
 				for (const f of files) {
-					try { await rm(join(dir, f)); } catch { /* ignore */ }
+					try {
+						await rm(join(dir, f));
+					} catch {
+						/* ignore */
+					}
 				}
 			}
 		}
@@ -738,7 +775,11 @@ export default function (pi: ExtensionAPI) {
 		if (existsSync(threadDir)) {
 			const files = await readdir(threadDir);
 			for (const f of files) {
-				try { await rm(join(threadDir, f)); } catch { /* ignore */ }
+				try {
+					await rm(join(threadDir, f));
+				} catch {
+					/* ignore */
+				}
 			}
 		}
 
@@ -773,7 +814,6 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("memory-clear-global", {
 		description: "Clear global agent memory / 清空全局 Agent 记忆（agent.md）",
 		handler: async (_args, ctx) => doClearGlobal(ctx),
-	});
 	});
 
 	// --------------------------------------------------------------------------

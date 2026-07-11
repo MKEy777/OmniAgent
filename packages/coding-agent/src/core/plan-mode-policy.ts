@@ -46,6 +46,23 @@ const EXACT_COMMANDS = new Set([
 const SHELL_META_PATTERN = /[\n\r|&;<>(){}[\]$`"'*?]/;
 const TOOL_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9._-]*$/;
 
+const SAFE_READONLY_COMMANDS = new Set([
+	"cat",
+	"head",
+	"tail",
+	"wc",
+	"file",
+	"du",
+	"df",
+	"stat",
+	"env",
+	"printenv",
+	"uname",
+	"hostname",
+	"date",
+	"uptime",
+]);
+
 function normalizeForCompare(path: string): string {
 	return resolve(path);
 }
@@ -169,6 +186,27 @@ export function getPlanBashCommandDecision(command: string): PolicyDecision {
 	if (parts.length === 2 && (parts[0] === "which" || parts[0] === "where") && TOOL_NAME_PATTERN.test(parts[1])) {
 		return { allowed: true };
 	}
+
+	if (parts.length >= 1 && SAFE_READONLY_COMMANDS.has(parts[0])) {
+		return { allowed: true };
+	}
+
+	if (parts[0] === "git" && parts.length >= 2) {
+		const gitSubcmd = parts[1];
+		const safeGitSubcommands = new Set(["status", "log", "diff", "show", "branch", "tag", "remote", "stash"]);
+		if (safeGitSubcommands.has(gitSubcmd)) {
+			return { allowed: true };
+		}
+	}
+
+	if ((parts[0] === "npm" || parts[0] === "pnpm" || parts[0] === "yarn") && parts.length >= 2) {
+		const subcmd = parts[1];
+		const safeSubcmds = new Set(["list", "ls", "info", "view", "show", "outdated", "why", "explain"]);
+		if (safeSubcmds.has(subcmd)) {
+			return { allowed: true };
+		}
+	}
+
 	return {
 		allowed: false,
 		reason: "Plan mode blocks this bash command. Use read/grep/find/ls or switch to Coding mode.",

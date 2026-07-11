@@ -16,11 +16,10 @@ pi (pi-monorepo) is an open-source AI coding agent with a Terminal UI (TUI). It 
 
 ## Built-in Agent System
 
-pi has three built-in agents switchable via **Tab** key (empty input → toggle, text input → autocomplete):
+pi has two built-in agents switchable via **Tab** key (empty input → toggle, text input → autocomplete):
 
 - **Coding** (default): Full-access agent for development work. All tools available, no restrictions.
 - **Plan**: Read-only agent for code analysis and planning. Edit/write denied except `.pi/plan/**`, dangerous bash blocked.
-- **Commit**: Plan executor that reads `plan.json`, implements all tasks, runs tests, and commits.
 
 Architecture document: `docs/architecture/plan-agent-architecture.md`
 
@@ -41,6 +40,7 @@ Plan mode was built from scratch with the following architecture:
 | `packages/coding-agent/src/core/agent-session.ts` | `AgentProfile`, agent registry, `cycleAgent()`, `setActiveAgent()`, Plan mode tool enforcement |
 | `packages/coding-agent/src/core/plan-mode-policy.ts` | Plan mode path boundaries, external read-root extraction, bash allowlist decisions |
 | `packages/coding-agent/src/core/tools/plan-write.ts` | Dedicated Plan mode write tool for `.pi/plan/<name>/` artifacts |
+| `packages/coding-agent/src/core/tools/plan-question.ts` | Structured questioning tool for Plan mode (1-3 questions with optional options) |
 | `packages/coding-agent/src/modes/interactive/interactive-mode.ts` | `cycleAgent()` wired to Tab key via `app.agent.cycle` keybinding |
 | `packages/coding-agent/src/modes/interactive/components/custom-editor.ts` | Tab passthrough: text → autocomplete, empty → cycle agent |
 | `packages/coding-agent/src/modes/interactive/components/footer.ts` | Agent badge `[PLAN]` in footer status bar |
@@ -52,7 +52,7 @@ Plan mode was built from scratch with the following architecture:
 ```typescript
 {
   id: "plan",
-  activeTools: ["read", "grep", "find", "ls", "plan_write", "bash"],
+  activeTools: ["read", "grep", "find", "ls", "plan_write", "plan_question", "bash"],
 }
 ```
 
@@ -60,7 +60,8 @@ Plan mode was built from scratch with the following architecture:
 - `plan_write` only writes `.pi/plan/<name>/plan.json` and `.pi/plan/<name>/context/**` by default
 - `.pi/plan/context/project-background.md` requires explicit user confirmation before writing
 - `read`, `grep`, `find`, and `ls` default to the project root; external paths are allowed only when explicitly mentioned by the user
-- `bash` uses exact read-only command shapes for environment and git inspection; install, script execution, redirection, pipes, and unknown commands are blocked
+- `plan_question` allows structured user interaction with optional multiple-choice answers, used during intent alignment
+- `bash` uses layered read-only allowlist: exact commands, version checks, safe system commands (cat/head/tail/wc/du/df/stat/env/uname), git read subcommands (status/log/diff/show/branch/tag/remote/stash), and package manager info subcommands (npm/pnpm/yarn list/ls/info/view/show/outdated/why/explain)
 
 ### Plan File Format
 
@@ -212,3 +213,12 @@ JSONL storage with tree-based branching (fork/resume/navigate). Context compacti
 
 - TUI bash 命令输出增加 GB18030 回退解码，解决 Windows 旧代码页中文乱码
 - AGENTS.md 新增 context.md 维护规则：中文对话 + 每次有意义变更后更新
+
+### 2026-07-10: Plan Agent 优化 — 结构化提问、bash 白名单扩展、移除 Commit Agent
+
+- 新增 `plan_question` 工具：Plan 模式专用结构化提问，1-3 个问题带可选预定义选项，替代自由文本提问
+- 注册 `plan_question` 到工具系统（ToolName/allToolNames/createToolDefinition/createTool/createAllTools）
+- 扩展 `plan-mode-policy.ts` bash 白名单：SAFE_READONLY_COMMANDS（cat/head/tail/wc/du/df/stat/env/uname/uptime 等），安全 git 子命令（status/log/diff/show/branch/tag/remote/stash），安全包管理器子命令（npm/pnpm/yarn list/ls/info/view/show/outdated/why/explain）
+- 更新 Plan prompt 为三阶段结构（Phase 1: Ground in Environment → Phase 2: Intent Alignment → Phase 3: Implementation Planning），使用 plan_question 替代自由提问
+- 移除已废弃的 Commit Agent 所有引用（docs 和代码注释）
+- 更新所有文档反映双 Agent 结构

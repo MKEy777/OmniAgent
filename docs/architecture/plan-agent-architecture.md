@@ -2,131 +2,33 @@
 
 ## 概述
 
-pi 内置三 Agent 的 Agent 系统，通过 **Tab** 键切换（空输入 → cycle，有文本 → autocomplete）：
+pi 内置双 Agent 系统，通过 **Tab** 键切换（空输入 → cycle，有文本 → autocomplete）：
 
-| Agent | 模式 | 职责 |
-|-------|------|------|
-| Coding | 默认 | 全权开发，所有工具可用 |
-| Plan | 只读分析 | 代码分析与规划，禁止写源码 |
-| Commit | 计划执行 | 按 plan.json 自动执行并提交 |
+| Agent | 模式 | 职责 | 状态 |
+|-------|------|------|------|
+| Coding | 默认 | 全权开发，所有工具可用 | 已实现 |
+| Plan | 只读分析 | 代码分析与规划，禁止写源码 | 已实现 |
 
-三种 Agent 均为 `AgentProfile` 注册在 `AgentSession` 中，不是扩展。
-
----
-
-## Commit Agent
-
-### 目标
-
-读取 Plan 模式产出的 `plan.json`，按任务列表依次实现全部代码变更，运行验证命令，最后自动提交到 git。
-
-### 设计要点
-
-- **纯代码执行**：不做探索、不做架构决策，严格按 plan.json 中 `tasks[]` 逐条执行。
-- **即写即验**：每个 task 实现后立即运行 `testCmd`，失败则回退重试或记录 blocker。
-- **状态回写**：每个 task 完成后更新 `plan.json` 中的 `status`、`result`、`notes`，形成审计链。
-- **自动提交**：全部 task 完成且验证通过后，执行 git commit + git tag，消息从 plan.json 的 `title` 或 `goal` 提取。
-- **不替换 plan.json**：不允许修改 task 的 `files`/`tests`/`testCmd`/`goal`/`architecture` 等结构字段，只写 `status`/`notes`/`result`/`blocker`。
-- **仅运行指定的 testCmd**：不允许自行决定覆盖率、lint、类型检查等，除非 plan.json 有对应的 `verifyCmd` 字段。
-
-### AgentProfile 定义
-
-```typescript
-{
-  id: "commit",
-  activeTools: ["read", "bash", "edit", "write", "plan_write"],
-}
-```
-
-- `plan_write` 仅用于回写 `.pi/plan/<name>/plan.json` 的任务状态字段，不写源码。
-- `bash` 无限制（同 Coding），用于安装依赖、运行测试、git 操作。
-- `write`/`edit` 用于实现 task 中的源码变更，但受 plan.json 中 `files` 路径约束（软约束，靠 prompt 约束）。
-
-### System Prompt
-
-```text
-# COMMIT MODE (active)
-
-You are pi operating in COMMIT MODE.
-Your job is to read an existing plan.json and execute every pending task.
-
-## Workflow
-
-1. Read .pi/plan/<name>/plan.json (the user must specify which plan).
-2. Validate the plan: all tasks must have files[], tests[], and testCmd[].
-3. Execute tasks in order by id:
-   a. Mark task as in_progress.
-   b. Implement the code (use files[] paths).
-   c. Run testCmd. If it fails, fix and retry (max 3 attempts).
-   d. Mark task as completed, set result and notes.
-   e. Update plan.json with plan_write after each task.
-4. After all tasks completed:
-   a. Run the full test suite (if specified in plan).
-   b. git add all changed files.
-   c. git commit -m "<plan title>: <plan goal>".
-   d. Present the commit summary to the user.
-
-## Constraints
-
-- You MUST NOT modify plan.json structure fields: files, tests, testCmd, goal, architecture, techStack, entryPoints, assumptions, risks, name, title, version, revision.
-- You MAY update task status/notes/result/blocker.
-- If a task fails after 3 attempts, mark it as in_progress with a blocker note and stop.
-- If the user asks to adjust the plan, switch to Plan mode first.
-- Commit message format: conventional commits (feat/fix/docs).
-```
-
-### 状态流转
-
-```text
-Plan mode 输出:
-  plan.json (tasks: all pending)
-
-Commit mode 输入:
-  读取 plan.json
-
-对每个 task:
-  pending → in_progress → (成功) → completed
-                         → (失败 x3) → in_progress + blocker
-
-完成后:
-  git add → git commit → 通知用户
-```
-
-### 文件位置
-
-| 文件 | 角色 |
-|------|------|
-| `packages/coding-agent/src/core/agent-session.ts` | 注册 `commit` AgentProfile |
-| `packages/coding-agent/src/core/commit-mode-policy.ts` | Commit 模式路径约束与 plan.json 写权限 |
-| `packages/coding-agent/src/core/tools/plan-write.ts` | 已有工具，扩展允许 `plan.json` 状态字段写 |
-
-### 与 Plan 模式的关系
-
-```text
-Plan 模式 → 产出 .pi/plan/<name>/plan.json
-   ↓ 用户指定 plan name
-Commit 模式 → 读取 plan.json → 逐 task 执行 → 提交
-   ↓ 如果计划需要调整
-Plan 模式 → 用户修改 plan.json → 切回 Commit 继续
-```
+两种 Agent 均为 `AgentProfile` 注册在 `AgentSession` 中，不是扩展。
 
 ---
 
-## Plan 模式（已有）
+## Plan 模式
 
 ### AgentProfile
 
 ```typescript
 {
   id: "plan",
-  activeTools: ["read", "grep", "find", "ls", "plan_write", "bash"],
+  activeTools: ["read", "grep", "find", "ls", "plan_write", "plan_question", "bash"],
 }
 ```
 
 - 禁止 `write`/`edit` 源码
 - `plan_write` 仅允许 `.pi/plan/<name>/plan.json` 和 `.pi/plan/<name>/context/**`
 - `.pi/plan/context/project-background.md` 需用户明确确认
-- `bash` 仅允许只读命令（`git status`, `node --version` 等精确白名单）
+- `plan_question` 允许向用户发起结构化提问（1-3 个问题，可选预定义选项）
+- `bash` 仅允许只读命令（环境探测、git 检查、包信息查询）
 - 读路径默认限制在项目根内
 
 ### Plan 文件格式
@@ -164,7 +66,7 @@ Plan 模式 → 用户修改 plan.json → 切回 Commit 继续
 
 ---
 
-## Coding 模式（已有）
+## Coding 模式
 
 默认模式，激活全部工具（`read`, `bash`, `edit`, `write` + 扩展注册的工具），无路径或命令限制。
 
@@ -175,7 +77,7 @@ Plan 模式 → 用户修改 plan.json → 切回 Commit 继续
 ### 切换入口
 
 - **Tab 键**：空输入时 `cycleAgent()`，有文本时 autocomplete。
-- **斜杠命令**：`/agent plan`、`/agent commit`、`/agent coding`。
+- **斜杠命令**：`/agent plan`、`/agent coding`。
 
 ### 切换实现
 
@@ -216,7 +118,6 @@ Footer 状态栏显示当前 Agent 名称：
 ```text
 [PLAN] > _           # Plan 模式
 [CODING] > _         # Coding 模式（默认不显示）
-[COMMIT] > _         # Commit 模式
 ```
 
 Coding 模式为默认，Footer 可省略 badge 或显示灰色 `[CODING]`。
@@ -236,30 +137,26 @@ Coding 模式为默认，Footer 可省略 badge 或显示灰色 `[CODING]`。
 
 ### Bash 控制
 
-- 精确白名单（`EXACT_COMMANDS`）：`git status --short`、`pwd` 等
-- 版本检查白名单（`VERSION_COMMANDS` + `--version`）：`node --version` 等
-- `where`/`which` 白名单：`where node`、`which npm` 等
+Plan 模式 bash 白名单分层：
+
+- **精确命令**（`EXACT_COMMANDS`）：`git status --short`、`pwd` 等完全匹配
+- **版本检查**（`VERSION_COMMANDS` + `--version`）：`node --version` 等
+- **`where`/`which`**：`where node`、`which npm` 等
+- **只读系统命令**（`SAFE_READONLY_COMMANDS`）：`cat`、`head`、`tail`、`wc`、`file`、`du`、`df`、`stat`、`env`、`printenv`、`uname`、`hostname`、`date`、`uptime`
+- **安全 git 子命令**：`git status`、`git log`、`git diff`、`git show`、`git branch`、`git tag`、`git remote`、`git stash`
+- **安全包管理器子命令**：`npm/pnpm/yarn list/ls/info/view/show/outdated/why/explain`
 - Shell 元字符（`| & ; $` 等）一律拒绝
 - 未匹配命令一律拒绝
 
----
+### plan_question 工具
 
-## Commit 模式安全策略
+`plan_question` 是 Plan 模式专用的结构化提问工具：
 
-### 路径约束
-
-- **写路径**：无硬限制（工具层面允许任何路径），依靠 prompt 约束 Agent 只在 task `files[]` 范围内写
-- **plan.json 写**：通过 `plan_write` 工具，只允许回写 `status`/`notes`/`result`/`blocker` 字段
-  - `plan_write` 的已有路径验证保留（必须在 `.pi/plan/<name>/` 内）
-  - 额外约束：不允许写 `.pi/plan/<name>/context/`（那是 Plan 模式的范围）
-
-### Bash 控制
-
-无限制（同 Coding 模式），用于：
-- `npm install` / `pip install` 安装依赖
-- `vitest run` / `npm test` 运行验证
-- `git add` / `git commit` 提交
-- 其他构建或验证命令
+- 允许 Agent 向用户发起 **1-3 个问题**，每个问题可带预定义选项
+- 纯展示型工具：execute 返回格式化文本，TUI render 显示问题列表
+- 用户回答作为下一条消息发送
+- 替代 prompt 中 "Ask at most 3 clarifying questions" 的自由文本方式
+- 仅在关键歧义时使用，优先做合理假设并记录在 assumptions[]
 
 ---
 
@@ -267,10 +164,10 @@ Coding 模式为默认，Footer 可省略 badge 或显示灰色 `[CODING]`。
 
 | 文件 | 角色 |
 |------|------|
-| `packages/coding-agent/src/core/agent-session.ts` | 三 AgentProfile 注册、切换逻辑 |
+| `packages/coding-agent/src/core/agent-session.ts` | AgentProfile 注册、切换逻辑 |
 | `packages/coding-agent/src/core/plan-mode-policy.ts` | Plan 模式路径/bash 策略 |
-| `packages/coding-agent/src/core/commit-mode-policy.ts` | Commit 模式路径约束（可选） |
 | `packages/coding-agent/src/core/tools/plan-write.ts` | plan_write 工具 |
+| `packages/coding-agent/src/core/tools/plan-question.ts` | plan_question 工具 |
 | `packages/coding-agent/src/modes/interactive/interactive-mode.ts` | Tab 键 cycle agent |
 | `packages/coding-agent/src/modes/interactive/components/footer.ts` | Agent badge 显示 |
 | `packages/coding-agent/src/modes/interactive/components/custom-editor.ts` | Tab passthrough |

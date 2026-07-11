@@ -43,6 +43,11 @@ export {
 	type LsToolOptions,
 } from "./ls.ts";
 export {
+	createPlanQuestionTool,
+	createPlanQuestionToolDefinition,
+	type PlanQuestionToolInput,
+} from "./plan-question.ts";
+export {
 	createPlanWriteTool,
 	createPlanWriteToolDefinition,
 	type PlanWriteOperations,
@@ -82,13 +87,14 @@ import { createEditTool, createEditToolDefinition, type EditToolOptions } from "
 import { createFindTool, createFindToolDefinition, type FindToolOptions } from "./find.ts";
 import { createGrepTool, createGrepToolDefinition, type GrepToolOptions } from "./grep.ts";
 import { createLsTool, createLsToolDefinition, type LsToolOptions } from "./ls.ts";
+import { createPlanQuestionTool, createPlanQuestionToolDefinition } from "./plan-question.ts";
 import { createPlanWriteTool, createPlanWriteToolDefinition, type PlanWriteToolOptions } from "./plan-write.ts";
 import { createReadTool, createReadToolDefinition, type ReadToolOptions } from "./read.ts";
 import { createWriteTool, createWriteToolDefinition, type WriteToolOptions } from "./write.ts";
 
 export type Tool = AgentTool<any>;
 export type ToolDef = ToolDefinition<any, any>;
-export type ToolName = "read" | "bash" | "edit" | "write" | "grep" | "find" | "ls" | "plan_write";
+export type ToolName = "read" | "bash" | "edit" | "write" | "grep" | "find" | "ls" | "plan_write" | "plan_question";
 export const allToolNames: Set<ToolName> = new Set([
 	"read",
 	"bash",
@@ -98,6 +104,7 @@ export const allToolNames: Set<ToolName> = new Set([
 	"find",
 	"ls",
 	"plan_write",
+	"plan_question",
 ]);
 
 export interface ToolsOptions {
@@ -129,6 +136,8 @@ export function createToolDefinition(toolName: ToolName, cwd: string, options?: 
 			return createLsToolDefinition(cwd, options?.ls);
 		case "plan_write":
 			return createPlanWriteToolDefinition(cwd, options?.planWrite);
+		case "plan_question":
+			return createPlanQuestionToolDefinition();
 		default:
 			throw new Error(`Unknown tool name: ${toolName}`);
 	}
@@ -152,6 +161,8 @@ export function createTool(toolName: ToolName, cwd: string, options?: ToolsOptio
 			return createLsTool(cwd, options?.ls);
 		case "plan_write":
 			return createPlanWriteTool(cwd, options?.planWrite);
+		case "plan_question":
+			return createPlanQuestionTool();
 		default:
 			throw new Error(`Unknown tool name: ${toolName}`);
 	}
@@ -185,6 +196,7 @@ export function createAllToolDefinitions(cwd: string, options?: ToolsOptions): R
 		find: createFindToolDefinition(cwd, options?.find),
 		ls: createLsToolDefinition(cwd, options?.ls),
 		plan_write: createPlanWriteToolDefinition(cwd, options?.planWrite),
+		plan_question: createPlanQuestionToolDefinition(),
 	};
 }
 
@@ -216,5 +228,6 @@ export function createAllTools(cwd: string, options?: ToolsOptions): Record<Tool
 		find: createFindTool(cwd, options?.find),
 		ls: createLsTool(cwd, options?.ls),
 		plan_write: createPlanWriteTool(cwd, options?.planWrite),
+		plan_question: createPlanQuestionTool(),
 	};
 }
